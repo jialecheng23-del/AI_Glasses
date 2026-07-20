@@ -1,0 +1,84 @@
+// =====================================================================
+//  扬声器最小测试 —— XIAO ESP32-S3 + MAX98357 + 喇叭
+//  只测喇叭，不用 WiFi/BLE/摄像头/任何额外库。
+//  烧录后喇叭应该“哔——哔——”一秒一次地响。
+//
+//  接线（和主固件一致）：
+//    MAX98357 BCLK -> D8 (GPIO7)
+//    MAX98357 LRC  -> D9 (GPIO8)
+//    MAX98357 DIN  -> D10(GPIO9)
+//    MAX98357 VIN  -> 5V（或 3V3）
+//    MAX98357 GND  -> GND
+//    MAX98357 SD   -> 3V3   ★必须接高电平，否则芯片关断、完全没声音（最常见的坑）
+//    MAX98357 GAIN -> 悬空(9dB) 或 接 GND(15dB 更响)
+//    喇叭          -> 接 MAX98357 的 +/- 两个端子
+// =====================================================================
+
+#include <driver/i2s.h>
+#include <math.h>
+
+#define SPK_I2S_BCLK 7    // D8
+#define SPK_I2S_LRC  8    // D9
+#define SPK_I2S_DIN  9    // D10
+#define SPK_PORT     I2S_NUM_1
+
+#define SAMPLE_RATE  16000
+#define AMP          9000   // 振幅 0~32767，太大可能破音，先用 9000
+
+void initI2S() {
+  i2s_config_t cfg = {};
+  cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  cfg.sample_rate = SAMPLE_RATE;
+  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  cfg.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+  cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  cfg.dma_buf_count = 8;
+  cfg.dma_buf_len = 256;
+  cfg.use_apll = false;
+  cfg.tx_desc_auto_clear = true;
+  i2s_driver_install(SPK_PORT, &cfg, 0, NULL);
+
+  i2s_pin_config_t pins = {};
+  pins.bck_io_num = SPK_I2S_BCLK;
+  pins.ws_io_num  = SPK_I2S_LRC;
+  pins.data_out_num = SPK_I2S_DIN;
+  pins.data_in_num  = I2S_PIN_NO_CHANGE;
+  i2s_set_pin(SPK_PORT, &pins);
+  i2s_zero_dma_buffer(SPK_PORT);
+}
+
+// 播放一个正弦音 freq Hz、持续 ms 毫秒
+void playTone(int freq, int ms) {
+  const int N = 256;
+  int16_t buf[N];
+  static float phase = 0;
+  float step = 2.0f * PI * freq / SAMPLE_RATE;
+  long total = (long)SAMPLE_RATE * ms / 1000;
+  long done = 0;
+  while (done < total) {
+    int cnt = (total - done < N) ? (total - done) : N;
+    for (int i = 0; i < cnt; i++) {
+      buf[i] = (int16_t)(sinf(phase) * AMP);
+      phase += step;
+      if (phase > 2.0f * PI) phase -= 2.0f * PI;
+    }
+    size_t w = 0;
+    i2s_write(SPK_PORT, buf, cnt * 2, &w, portMAX_DELAY);
+    done += cnt;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  initI2S();
+  Serial.println("Speaker test start - 应该听到哔哔声");
+}
+
+void loop() {
+  Serial.println("beep");
+  playTone(880, 300);            // 响 0.3 秒（880Hz）
+  i2s_zero_dma_buffer(SPK_PORT); // 清空，制造停顿
+  delay(300);                    // 停 0.3 秒
+}
