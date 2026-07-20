@@ -1,1 +1,1177 @@
+// =====================================================================
+//  XIAO ESP32-S3 Sense — AI 眼镜 一代固件 (v15)
+//  聊天=DeepSeek  识图=百度千帆  语音识别+合成=百度智能云  麦克风=板载PDM
+//  v15: 预录缓冲+唤醒词门控——只有听到"小智同学"才应答"我在"，噪音触发全静默；
+//       没听清时本地语音提示并自动重录；AI失败静默；蓝牙改为真模式切换(蓝牙/WiFi二选一)
+//  开发板 XIAO_ESP32S3，PSRAM 必须选 OPI PSRAM，装 ArduinoJson
+//
+//  —— 使用方法 ——
+//  按键:  短按=拍照识图   长按1秒=语音对话（不需要唤醒词）
+//  语音:  说"小智同学"(约2秒后) -> "我在" -> 说指令 -> "咚" -> 执行
+//         或一口气"小智同学几点了"直接执行；噪音/别的话不会让它出声
+//  指令:  关闭/打开蓝牙、音量调到50/静音、几点了/星期几、拍照/这是什么、其它转AI聊天
+//  模式:  btoff=WiFi模式(默认,语音助手可用)  bton=蓝牙模式(WiFi全关,语音AI不可用!)
+// =====================================================================
 
+// ====================== ① 配置 ======================
+#define DEFAULT_WIFI_SSID   ""
+#define DEFAULT_WIFI_PASS   ""
+#define DEFAULT_API_URL     "https://qianfan.baidubce.com/v2/chat/completions"  // 千帆接口（识图用）
+#define DEFAULT_API_KEY     ""                // 千帆 API Key（占位，用 key 命令写入）
+#define DEFAULT_VL_MODEL    "" // 识图模型
+#define DEFAULT_CHAT_MODEL  "deepseek-chat"          // 聊天模型（DeepSeek）
+#define DEFAULT_AI_PROMPT   "用简洁的中文描述这张图片里的主要内容"
+#define BAIDU_API_KEY       ""   // 百度语音 Key
+#define BAIDU_SECRET_KEY    ""  // 百度语音 Secret
+#define DEFAULT_CHAT_URL    "https://api.deepseek.com/chat/completions"  // DeepSeek 接口
+#define DEFAULT_CHAT_KEY    ""   // ★★★ 改成你的 DeepSeek 密钥 ★★★
+#define BLE_DEVICE_NAME     "XIAO_EYE"
+#define DEFAULT_VOLUME      80
+#define RECORD_SECONDS      4
+#define AUDIO_PORT          8000
+#define AUDIO_SAMPLE_RATE   16000
+#define DEFAULT_WAKE_ON     1     // 语音唤醒默认开
+#define WAKE_THRESH_DEFAULT 800  // 触发响度阈值(不能删!)。现在误触发不出声,可放心调低,建议 wakelvl 1500
+#define WAKE_WINDOWS        6     // 需连续响约0.2秒才触发（比一声脆响长，比半个词短）
+#define WAKE_COOLDOWN_MS    1500  // 播完声音后的冷却(ms)
+#define WAKE_PRE_MS         900   // 预录时长(ms)：一直保留最近这么久的声音，保证"小智同学"整句被录进去
+#define WAKE_POST_MS        2800  // 触发后最长继续录(ms)——"小智同学+短问题"一口气说完也装得下
+#define WAKE_SILENCE_MS     600   // 说完停顿这么久就提前结束抓音、立刻送识别（不傻等）
+// ====================================================
+
+#include <esp_camera.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
+#include <mbedtls/base64.h>
+#include <driver/i2s.h>
+#include "esp_system.h"
+#include <time.h>
+
+#define SERVICE_UUID            "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_RX  "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_TX  "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+#define BOOT_BTN      0
+#define LED_PIN       21
+#define LED_ACTIVE_LOW 1
+
+#define PWDN_GPIO_NUM -1
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 10
+#define SIOD_GPIO_NUM 40
+#define SIOC_GPIO_NUM 39
+#define Y9_GPIO_NUM 48
+#define Y8_GPIO_NUM 11
+#define Y7_GPIO_NUM 12
+#define Y6_GPIO_NUM 14
+#define Y5_GPIO_NUM 16
+#define Y4_GPIO_NUM 18
+#define Y3_GPIO_NUM 17
+#define Y2_GPIO_NUM 15
+#define VSYNC_GPIO_NUM 38
+#define HREF_GPIO_NUM 47
+#define PCLK_GPIO_NUM 13
+
+#define SPK_I2S_BCLK  7
+#define SPK_I2S_LRC   8
+#define SPK_I2S_DIN   9
+#define SPK_I2S_PORT  I2S_NUM_1
+
+#define MIC_PDM_CLK   42
+#define MIC_PDM_DATA  41
+#define MIC_I2S_PORT  I2S_NUM_0
+#define MIC_GAIN      2
+
+enum {
+  EVT_BOOT=10, EVT_BLE_CONN=11, EVT_WIFI_OK=13, EVT_WIFI_FAIL=14,
+  EVT_CAP_OK=21, EVT_AI_START=22, EVT_AI_OK=23, EVT_IMG_START=24, EVT_IMG_OK=25,
+  EVT_REC=26, EVT_SPEAK=27, EVT_WAKE=28, EVT_AUDIO_CONN=30, EVT_AUDIO_END=31,
+  ERR_WIFI=50, ERR_CAM=51, ERR_OOM=52, ERR_HTTP=53, ERR_JSON=54, ERR_BUSY=55
+};
+enum { CMD_PHOTO=1, CMD_SHOT=2, CMD_ASK=3, CMD_LISTEN=4, CMD_SAY=5, CMD_BEEP=6 };
+
+typedef struct { uint8_t cmd; char* text; } cmd_t;
+
+// ====================== 全局状态变量 ======================
+BLEServer*         pServer = nullptr;
+BLECharacteristic* pTx     = nullptr;
+volatile bool      deviceConnected = false;
+esp_bd_addr_t      peerAddr;
+bool               camReady  = false;
+volatile bool      g_busy    = false;
+volatile bool      g_audioPlaying = false;
+volatile uint8_t   g_volume  = DEFAULT_VOLUME;
+QueueHandle_t      cmdQueue;
+Preferences        prefs;
+WiFiServer         audioServer(AUDIO_PORT);
+SemaphoreHandle_t  notifyMutex = NULL;
+
+bool g_btEnabled = false;   // 模式开关(存NVS)：false=WiFi模式(默认) true=蓝牙模式(WiFi全关)
+
+volatile bool g_wakeEnabled = DEFAULT_WAKE_ON;
+volatile int  g_wakeThresh  = WAKE_THRESH_DEFAULT;
+volatile bool g_micWanted   = false;
+volatile bool g_micHeld     = false;
+
+// 缓存语音（第一次联网合成后常驻PSRAM，之后零延迟秒播）
+uint8_t* g_hintPcm  = NULL; size_t g_hintLen  = 0;   // "我在"
+uint8_t* g_retryPcm = NULL; size_t g_retryLen = 0;   // "没听清，请再说一遍"
+// wakeTask 抓取的唤醒音频（预录+后录，含"小智同学"整句），worker 识别完负责释放
+uint8_t* g_wakeBuf  = NULL;
+volatile size_t g_wakeLen = 0;
+// 冷静期：抓音后发现没有唤醒词(被噪音骗了)，8秒内不再触发，防止对着噪音连环识别
+volatile uint32_t g_wakeMuteUntil = 0;
+
+String g_ssid, g_pass, g_apiurl, g_apikey, g_vlmodel, g_chatmodel, g_prompt;
+String g_chaturl, g_chatkey;
+String g_bkey, g_bsec, g_btoken = "";
+
+enum wifi_state_t { WIFI_IDLE, WIFI_CONNECTING, WIFI_READY };
+wifi_state_t wifiState = WIFI_IDLE;
+uint32_t     wifiRetry = 0;
+bool         wifiNeedReconnect = false;
+
+#define PAYLOAD 178
+// —— 前置声明（只是"函数名单"，函数完整代码都在文件后面）——
+void sendStatus();
+void ttsSpeak(const String& textIn);
+void routeVoice(const String& qIn);
+void captureAndAnalyze();
+void speakTimeDate(bool wantTime, bool wantDate);
+bool stripWakeWord(String& q);
+int  extractNumber(const String& s);
+String nowString();
+void playShutter();
+void doVoiceChat(bool needWake);
+bool ttsFetch(const String& textIn, uint8_t** out, size_t* outLen);
+void playPcm(const uint8_t* pcm, size_t len);
+void speakCached(const char* text, uint8_t** cache, size_t* cacheLen);
+String recordAndRecognize(bool endBeep);
+
+// ====================== BLE 发送封装 ======================
+void notifyRaw(const uint8_t* d, size_t n) {
+  if (!deviceConnected || !pTx) return;
+  if (notifyMutex) xSemaphoreTake(notifyMutex, portMAX_DELAY);
+  pTx->setValue((uint8_t*)d, n);
+  pTx->notify();
+  if (notifyMutex) xSemaphoreGive(notifyMutex);
+  vTaskDelay(pdMS_TO_TICKS(8));
+}
+void notifyText(const String& s) {
+  Serial.println(s);
+  notifyRaw((const uint8_t*)s.c_str(), s.length());
+}
+void sendEvent(int code, const char* msg) {
+  String s = (code >= 50 ? "ERR:" : "EVT:");
+  s += code; s += ":"; s += msg;
+  notifyText(s);
+}
+void sendAIAnswer(const char* txt) {
+  size_t total = strlen(txt);
+  Serial.println(String("AI答案> ") + txt);
+  notifyText(String("AI>BEGIN:") + total);
+  uint16_t seq = 0; size_t off = 0;
+  uint8_t frame[PAYLOAD + 16];
+  while (off < total && deviceConnected) {
+    size_t n = (total - off < PAYLOAD - 8) ? (total - off) : (PAYLOAD - 8);
+    int hl = snprintf((char*)frame, sizeof(frame), "AI:%u:", seq);
+    memcpy(frame + hl, txt + off, n);
+    notifyRaw(frame, hl + n);
+    off += n; seq++;
+  }
+  notifyText(String("AI>END:") + total + ":" + seq);
+}
+void sendImage(const uint8_t* buf, size_t len) {
+  sendEvent(EVT_IMG_START, "");
+  notifyText(String("IMG>BEGIN:") + len);
+  uint16_t seq = 0; size_t off = 0;
+  uint8_t frame[PAYLOAD + 2];
+  while (off < len && deviceConnected) {
+    size_t n = (len - off < PAYLOAD) ? (len - off) : PAYLOAD;
+    frame[0] = seq >> 8; frame[1] = seq & 0xFF;
+    memcpy(frame + 2, buf + off, n);
+    notifyRaw(frame, n + 2);
+    off += n; seq++;
+  }
+  notifyText(String("IMG>END:") + len + ":" + seq);
+  sendEvent(EVT_IMG_OK, "");
+}
+void enqueueCmd(uint8_t cmd, const String& text) {
+  cmd_t c; c.cmd = cmd;
+  c.text = text.length() ? strdup(text.c_str()) : NULL;
+  if (xQueueSend(cmdQueue, &c, 0) != pdPASS && c.text) free(c.text);
+}
+
+// ====================== 命令处理 ======================
+void handleCommand(const String& cmdIn) {
+  String cmd = cmdIn; cmd.trim();
+  if (!cmd.length()) return;
+  Serial.println("CMD> " + cmd);
+  String head = cmd; head.toLowerCase();
+
+  if (head == "photo")       enqueueCmd(CMD_PHOTO, "");
+  else if (head == "shot" || head == "pic") enqueueCmd(CMD_SHOT, "");
+  else if (head == "listen") enqueueCmd(CMD_LISTEN, "");
+  else if (head == "beep")   enqueueCmd(CMD_BEEP, "");
+  else if (cmd.startsWith("ask "))  enqueueCmd(CMD_ASK, cmd.substring(4));
+  else if (cmd.startsWith("say "))  enqueueCmd(CMD_SAY, cmd.substring(4));
+  else if (head == "status") sendStatus();
+  else if (head == "reboot") ESP.restart();
+  else if (head == "reset")  { prefs.clear(); sendEvent(EVT_BOOT, "cfg cleared"); ESP.restart(); }
+  else if (head == "bton")  { prefs.putBool("bt", true);  sendEvent(EVT_BOOT, "bt mode, reboot..");  delay(200); ESP.restart(); }
+  else if (head == "btoff") { prefs.putBool("bt", false); sendEvent(EVT_BOOT, "wifi mode, reboot.."); delay(200); ESP.restart(); }
+  else if (head == "wake on")  { g_wakeEnabled = true;  prefs.putBool("wake", true);  sendEvent(EVT_BOOT, "wake on"); }
+  else if (head == "wake off") { g_wakeEnabled = false; prefs.putBool("wake", false); sendEvent(EVT_BOOT, "wake off"); }
+  else if (cmd.startsWith("wakelvl ")) {
+    int lv = cmd.substring(8).toInt(); if (lv < 300) lv = 300; if (lv > 20000) lv = 20000;
+    g_wakeThresh = lv; prefs.putInt("wakelvl", lv); sendEvent(EVT_BOOT, (String("wakelvl=") + lv).c_str());
+  }
+  else if (cmd.startsWith("wifi ")) {
+    int sp = cmd.indexOf(' ', 5);
+    if (sp > 0) { g_ssid = cmd.substring(5, sp); g_pass = cmd.substring(sp + 1);
+      prefs.putString("ssid", g_ssid); prefs.putString("pass", g_pass);
+      wifiNeedReconnect = true; sendEvent(EVT_BOOT, "wifi saved"); }
+  }
+  else if (cmd.startsWith("vol ")) {
+    int vv = cmd.substring(4).toInt(); if (vv < 0) vv = 0; if (vv > 100) vv = 100;
+    g_volume = vv; prefs.putUChar("vol", g_volume); sendEvent(EVT_BOOT, (String("vol=") + g_volume).c_str());
+  }
+  else if (cmd.startsWith("key "))    { g_apikey = cmd.substring(4); prefs.putString("key", g_apikey);    sendEvent(EVT_BOOT,"key saved"); }
+  else if (cmd.startsWith("bkey "))   { g_bkey = cmd.substring(5); prefs.putString("bkey", g_bkey); g_btoken=""; sendEvent(EVT_BOOT,"bkey saved"); }
+  else if (cmd.startsWith("bsec "))   { g_bsec = cmd.substring(5); prefs.putString("bsec", g_bsec); g_btoken=""; sendEvent(EVT_BOOT,"bsec saved"); }
+  else if (cmd.startsWith("cmodel ")) { g_chatmodel = cmd.substring(7); prefs.putString("cmodel", g_chatmodel); sendEvent(EVT_BOOT,"cmodel saved"); }
+  else if (cmd.startsWith("url "))    { g_apiurl = cmd.substring(4); prefs.putString("url", g_apiurl); sendEvent(EVT_BOOT,"url saved"); }
+  else if (cmd.startsWith("vlmodel ")) { g_vlmodel = cmd.substring(8); prefs.putString("vlmodel", g_vlmodel); sendEvent(EVT_BOOT,"vlmodel saved"); }
+  else if (cmd.startsWith("chaturl ")) { g_chaturl = cmd.substring(8); prefs.putString("chaturl", g_chaturl); sendEvent(EVT_BOOT,"chaturl saved"); }
+  else if (cmd.startsWith("chatkey ")) { g_chatkey = cmd.substring(8); prefs.putString("chatkey", g_chatkey); sendEvent(EVT_BOOT,"chatkey saved"); }
+  else if (head == "chatreset") { g_chaturl = DEFAULT_CHAT_URL; g_chatkey = DEFAULT_CHAT_KEY; prefs.remove("chaturl"); prefs.remove("chatkey"); sendEvent(EVT_BOOT,"chat->default"); }
+  else if (cmd.startsWith("prompt ")) { g_prompt = cmd.substring(7); prefs.putString("prompt", g_prompt); sendEvent(EVT_BOOT,"prompt saved"); }
+  else Serial.println("unknown cmd");
+}
+
+void pollSerial() {
+  static String line;
+  while (Serial.available()) {
+    char ch = (char)Serial.read();
+    if (ch == '\n' || ch == '\r') { if (line.length()) { handleCommand(line); line = ""; } }
+    else line += ch;
+  }
+}
+
+class RxCb : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* c) override {
+    std::string v = c->getValue();
+    if (!v.empty()) handleCommand(String(v.c_str()));
+  }
+};
+class ServerCb : public BLEServerCallbacks {
+  void onConnect(BLEServer* s, esp_ble_gatts_cb_param_t* param) override {
+    deviceConnected = true;
+    memcpy(peerAddr, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+    s->updateConnParams(peerAddr, 24, 48, 0, 600);
+    Serial.println("BLE Connected"); sendEvent(EVT_BLE_CONN, "");
+  }
+  void onDisconnect(BLEServer* s) override {
+    deviceConnected = false;
+    Serial.println("BLE Disconnected -> re-advertise");
+    delay(80); BLEDevice::startAdvertising();
+  }
+};
+
+void sendStatus() {
+  String s = "ST:ble=1";
+  s += ",wifi=" + String(wifiState == WIFI_READY ? "ok" : (wifiState == WIFI_CONNECTING ? "conn" : "idle"));
+  if (wifiState == WIFI_READY) s += ",ip=" + WiFi.localIP().toString();
+  s += ",vol=" + String(g_volume);
+  s += ",cam=" + String(camReady ? 1 : 0);
+  s += ",heap=" + String(ESP.getFreeHeap() / 1024) + "k";
+  s += ",psram=" + String(ESP.getFreePsram() / 1024) + "k";
+  s += ",llm=" + String(g_apikey.length() > 8 ? 1 : 0);
+  s += ",baidu=" + String(g_bkey.length() > 8 ? 1 : 0);
+  s += ",capi=" + String(g_chatkey.length() > 8 ? 1 : 0);
+  s += ",wake=" + String(g_wakeEnabled ? 1 : 0);
+  s += ",wakelvl=" + String(g_wakeThresh);
+  s += ",bt=" + String(g_btEnabled ? 1 : 0);
+  s += ",cm=" + g_chatmodel;
+  notifyText(s);
+}
+
+String urlEncode(const String& s) {
+  String o; const char* hex = "0123456789ABCDEF";
+  for (size_t i = 0; i < s.length(); i++) {
+    uint8_t c = (uint8_t)s[i];
+    if ((c>='0'&&c<='9')||(c>='A'&&c<='Z')||(c>='a'&&c<='z')) o += (char)c;
+    else { o += '%'; o += hex[c >> 4]; o += hex[c & 0xF]; }
+  }
+  return o;
+}
+String utf8Cap(const String& s, int maxBytes) {
+  if ((int)s.length() <= maxBytes) return s;
+  int cut = maxBytes;
+  while (cut > 0 && ((uint8_t)s[cut] & 0xC0) == 0x80) cut--;
+  return s.substring(0, cut);
+}
+
+// ====================== 摄像头初始化 ======================
+bool initCamera() {
+  if (camReady) return true;
+  camera_config_t cfg = {};
+  cfg.ledc_channel = LEDC_CHANNEL_0; cfg.ledc_timer = LEDC_TIMER_0;
+  cfg.pin_d0=Y2_GPIO_NUM; cfg.pin_d1=Y3_GPIO_NUM; cfg.pin_d2=Y4_GPIO_NUM; cfg.pin_d3=Y5_GPIO_NUM;
+  cfg.pin_d4=Y6_GPIO_NUM; cfg.pin_d5=Y7_GPIO_NUM; cfg.pin_d6=Y8_GPIO_NUM; cfg.pin_d7=Y9_GPIO_NUM;
+  cfg.pin_xclk=XCLK_GPIO_NUM; cfg.pin_pclk=PCLK_GPIO_NUM;
+  cfg.pin_vsync=VSYNC_GPIO_NUM; cfg.pin_href=HREF_GPIO_NUM;
+  cfg.pin_sscb_sda=SIOD_GPIO_NUM; cfg.pin_sscb_scl=SIOC_GPIO_NUM;
+  cfg.pin_pwdn=PWDN_GPIO_NUM; cfg.pin_reset=RESET_GPIO_NUM;
+  cfg.xclk_freq_hz=20000000;
+  cfg.frame_size=FRAMESIZE_QVGA; cfg.pixel_format=PIXFORMAT_JPEG;
+  cfg.fb_location=CAMERA_FB_IN_PSRAM; cfg.jpeg_quality=12; cfg.fb_count=1;
+  cfg.grab_mode=CAMERA_GRAB_LATEST;
+  esp_err_t err = esp_camera_init(&cfg);
+  if (err != ESP_OK) { Serial.printf("Camera fail 0x%x\n", err); return false; }
+  camReady = true; return true;
+}
+
+// ====================== WiFi 状态机（仅WiFi模式运行）======================
+void updateWiFi() {
+  if (wifiNeedReconnect) { wifiNeedReconnect = false; WiFi.disconnect(); wifiState = WIFI_IDLE; }
+  switch (wifiState) {
+    case WIFI_IDLE:
+      Serial.printf("[wifi] 正在连: %s\n", g_ssid.c_str());
+      WiFi.begin(g_ssid.c_str(), g_pass.c_str());
+      wifiState = WIFI_CONNECTING; wifiRetry = 0; break;
+    case WIFI_CONNECTING:
+      if (WiFi.status() == WL_CONNECTED) {
+        wifiState = WIFI_READY; sendEvent(EVT_WIFI_OK, WiFi.localIP().toString().c_str());
+        configTime(8 * 3600, 0, "ntp.aliyun.com", "cn.pool.ntp.org");
+      }
+      else if (++wifiRetry > 20) { WiFi.disconnect(); wifiState = WIFI_IDLE; sendEvent(EVT_WIFI_FAIL, ""); }
+      break;
+    case WIFI_READY:
+      if (WiFi.status() != WL_CONNECTED) wifiState = WIFI_IDLE; break;
+  }
+}
+
+// ====================== 喇叭 I2S 初始化 ======================
+void initSpeaker() {
+  i2s_config_t c = {};
+  c.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  c.sample_rate = AUDIO_SAMPLE_RATE;
+  c.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  c.channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT;
+  c.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  c.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  c.dma_buf_count = 8; c.dma_buf_len = 256;
+  c.use_apll = false; c.tx_desc_auto_clear = true;
+  i2s_driver_install(SPK_I2S_PORT, &c, 0, NULL);
+  i2s_pin_config_t p = {};
+  p.bck_io_num = SPK_I2S_BCLK; p.ws_io_num = SPK_I2S_LRC;
+  p.data_out_num = SPK_I2S_DIN; p.data_in_num = I2S_PIN_NO_CHANGE;
+  i2s_set_pin(SPK_I2S_PORT, &p);
+  i2s_start(SPK_I2S_PORT);
+  i2s_zero_dma_buffer(SPK_I2S_PORT);
+}
+
+// ====================== 板载 PDM 麦克风 ======================
+bool micDriverInstall() {
+  i2s_config_t c = {};
+  c.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_PDM);
+  c.sample_rate = AUDIO_SAMPLE_RATE;
+  c.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  c.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+  c.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  c.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  c.dma_buf_count = 8; c.dma_buf_len = 256;
+  if (i2s_driver_install(MIC_I2S_PORT, &c, 0, NULL) != ESP_OK) return false;
+  i2s_pin_config_t p = {};
+  p.bck_io_num = I2S_PIN_NO_CHANGE;
+  p.ws_io_num = MIC_PDM_CLK;
+  p.data_out_num = I2S_PIN_NO_CHANGE; p.data_in_num = MIC_PDM_DATA;
+  i2s_set_pin(MIC_I2S_PORT, &p);
+  return true;
+}
+bool recordMic(uint8_t** out, size_t* outLen, int seconds) {
+  g_micWanted = true;
+  uint32_t tw = millis();
+  while (g_micHeld && millis() - tw < 1000) vTaskDelay(pdMS_TO_TICKS(10));
+  size_t samples = (size_t)AUDIO_SAMPLE_RATE * seconds;
+  size_t bytes = samples * 2;
+  int16_t* pcm = (int16_t*)ps_malloc(bytes);
+  if (!pcm) pcm = (int16_t*)malloc(bytes);
+  if (!pcm) { g_micWanted = false; return false; }
+  if (!micDriverInstall()) { free(pcm); g_micWanted = false; return false; }
+  int16_t tmp[512]; size_t br;
+  for (int i = 0; i < 6; i++) i2s_read(MIC_I2S_PORT, tmp, sizeof(tmp), &br, pdMS_TO_TICKS(200));
+  size_t got = 0;
+  while (got < samples) {
+    if (i2s_read(MIC_I2S_PORT, tmp, sizeof(tmp), &br, pdMS_TO_TICKS(500)) != ESP_OK) break;
+    int n = br / 2;
+    for (int i = 0; i < n && got < samples; i++) {
+      int32_t s = (int32_t)tmp[i] * MIC_GAIN;
+      if (s > 32767) s = 32767; if (s < -32768) s = -32768;
+      pcm[got++] = (int16_t)s;
+    }
+  }
+  i2s_driver_uninstall(MIC_I2S_PORT);
+  g_micWanted = false;
+  if (got == 0) { free(pcm); return false; }
+  *out = (uint8_t*)pcm; *outLen = got * 2;
+  return true;
+}
+
+// ---------- 语音唤醒任务：预录缓冲 + 声音触发抓取 ----------
+// 一直保留最近约1秒的声音；触发时把预录1秒+续录1.6秒拼成整段交给worker识别。
+// 应不应答由识别结果决定（必须含"小智同学"），噪音触发只白抓一次音、不出声。
+// ---------- 语音唤醒任务：自适应底噪 + 预录缓冲 + 静音提前收工 ----------
+// 触发线不再固定，而是"比环境底噪突然响3倍"：安静房间自动灵敏，吵闹房间自动迟钝。
+// wakelvl 仍有效，作为"最低门槛"兜底。
+void wakeTask(void*) {
+  int hot = 0;
+  uint32_t quietT = millis();
+  static int16_t tmp[512]; size_t br;
+  const size_t preSamples = 16 * WAKE_PRE_MS;
+  static int16_t* pre = NULL;
+  if (!pre) pre = (int16_t*)ps_malloc(preSamples * 2);
+  size_t preW = 0; bool preFull = false;
+  int noiseFloor = 600;   // 环境底噪（滑动平均，自动学习）
+  for (;;) {
+    if (g_btEnabled || !g_wakeEnabled || g_micWanted || g_busy || g_audioPlaying) {
+      if (g_micHeld) { i2s_driver_uninstall(MIC_I2S_PORT); g_micHeld = false; }
+      hot = 0; preW = 0; preFull = false; quietT = millis();
+      vTaskDelay(pdMS_TO_TICKS(50)); continue;
+    }
+    if (millis() - quietT < WAKE_COOLDOWN_MS) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+    if (!g_micHeld) {
+      if (!micDriverInstall()) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+      g_micHeld = true; hot = 0; preW = 0; preFull = false;
+      for (int i = 0; i < 6; i++) i2s_read(MIC_I2S_PORT, tmp, sizeof(tmp), &br, pdMS_TO_TICKS(200));
+    }
+    if (i2s_read(MIC_I2S_PORT, tmp, sizeof(tmp), &br, pdMS_TO_TICKS(200)) != ESP_OK || br == 0) continue;
+    int n = br / 2; long sum = 0;
+    for (int i = 0; i < n; i++) { int a = tmp[i] < 0 ? -tmp[i] : tmp[i]; sum += a; }
+    int avg = (int)(sum / n);
+    // 自适应底噪：只在"不像说话"的窗口慢慢学习环境音量
+    if (avg < noiseFloor * 2) noiseFloor = (noiseFloor * 31 + avg) / 32;
+    if (noiseFloor < 150) noiseFloor = 150;
+    // 动态触发线 = 底噪的3倍，且不低于 wakelvl
+    int thr = noiseFloor * 3;
+    if (thr < g_wakeThresh) thr = g_wakeThresh;
+    // 写进预录环形缓冲（带增益）
+    if (pre) {
+      for (int i = 0; i < n; i++) {
+        int32_t s = (int32_t)tmp[i] * MIC_GAIN;
+        if (s > 32767) s = 32767; if (s < -32768) s = -32768;
+        pre[preW++] = (int16_t)s;
+        if (preW >= preSamples) { preW = 0; preFull = true; }
+      }
+    }
+    if (avg > thr) hot++; else hot = 0;
+    if (millis() < g_wakeMuteUntil) hot = 0;   // 冷静期内不触发
+    if (hot >= WAKE_WINDOWS && pre) {
+      hot = 0;
+      Serial.printf("[wake] 触发 响度=%d 底噪=%d 触发线=%d，抓取唤醒词...\n", avg, noiseFloor, thr);
+      size_t postSamples = 16 * WAKE_POST_MS;
+      size_t capSamples = preSamples + postSamples;
+      int16_t* capb = (int16_t*)ps_malloc(capSamples * 2);
+      if (!capb) { quietT = millis(); continue; }
+      size_t m = 0;
+      if (preFull) for (size_t i = preW; i < preSamples; i++) capb[m++] = pre[i];
+      for (size_t i = 0; i < preW; i++) capb[m++] = pre[i];
+      // 继续录：最长 WAKE_POST_MS；说完停顿 WAKE_SILENCE_MS 就提前收工、立刻送识别
+      uint32_t t0 = millis(); uint32_t lastLoud = millis();
+      while (millis() - t0 < WAKE_POST_MS && m < capSamples) {
+        if (i2s_read(MIC_I2S_PORT, tmp, sizeof(tmp), &br, pdMS_TO_TICKS(200)) != ESP_OK) break;
+        int k = br / 2; long s2 = 0;
+        for (int i = 0; i < k; i++) {
+          int a = tmp[i] < 0 ? -tmp[i] : tmp[i]; s2 += a;
+          if (m < capSamples) {
+            int32_t s = (int32_t)tmp[i] * MIC_GAIN;
+            if (s > 32767) s = 32767; if (s < -32768) s = -32768;
+            capb[m++] = (int16_t)s;
+          }
+        }
+        if (k > 0 && (int)(s2 / k) > noiseFloor * 2) lastLoud = millis();   // 还在说话
+        if (millis() - lastLoud > WAKE_SILENCE_MS && millis() - t0 > 500) break;  // 说完了，提前收工
+      }
+      i2s_driver_uninstall(MIC_I2S_PORT); g_micHeld = false;
+      if (g_wakeBuf) free(g_wakeBuf);
+      g_wakeBuf = (uint8_t*)capb; g_wakeLen = m * 2;
+      sendEvent(EVT_WAKE, String(avg).c_str());
+      enqueueCmd(CMD_LISTEN, "wake");
+      preW = 0; preFull = false;
+      quietT = millis();
+    }
+  }
+}
+// ====================== 百度语音 API ======================
+String baiduToken() {
+  if (g_btoken.length() > 0) return g_btoken;
+  if (wifiState != WIFI_READY) { Serial.println("[token] WiFi未连，跳过"); return ""; }
+  if (g_bkey.length() < 8) { Serial.println("[token] 百度Key没填!"); return ""; }
+  WiFiClientSecure c; c.setInsecure();
+  HTTPClient h; h.setTimeout(10000);
+  String url = String("https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=")
+               + g_bkey + "&client_secret=" + g_bsec;
+  if (!h.begin(c, url)) { Serial.println("[token] begin失败"); return ""; }
+  int code = h.GET();
+  String body = h.getString();
+  Serial.printf("[token] http=%d 返回=%s\n", code, body.substring(0, 150).c_str());
+  if (code == 200) {
+    DynamicJsonDocument d(1024);
+    if (!deserializeJson(d, body)) g_btoken = d["access_token"] | "";
+  }
+  h.end();
+  if (!g_btoken.length()) Serial.println("[token] 没拿到token(检查百度Key/额度)");
+  return g_btoken;
+}
+
+String asrRecognize(const uint8_t* pcm, size_t len) {
+  if (wifiState != WIFI_READY) { sendEvent(ERR_WIFI, "no wifi"); return ""; }
+  String tok = baiduToken();
+  if (!tok.length()) { sendEvent(ERR_HTTP, "btoken"); return ""; }
+  size_t b64cap = 4 * ((len + 2) / 3) + 1;
+  char* b64 = (char*)ps_malloc(b64cap);
+  if (!b64) b64 = (char*)malloc(b64cap);
+  if (!b64) { sendEvent(ERR_OOM, "b64"); return ""; }
+  size_t olen = 0;
+  mbedtls_base64_encode((unsigned char*)b64, b64cap, &olen, pcm, len);
+  String pre = String("{\"format\":\"pcm\",\"rate\":16000,\"channel\":1,\"cuid\":\"xiaoeye\",\"dev_pid\":1537,\"token\":\"")
+               + tok + "\",\"len\":" + len + ",\"speech\":\"";
+  String post = "\"}";
+  size_t bodyLen = pre.length() + olen + post.length();
+  char* body = (char*)ps_malloc(bodyLen + 1);
+  if (!body) body = (char*)malloc(bodyLen + 1);
+  if (!body) { free(b64); sendEvent(ERR_OOM, "asrbody"); return ""; }
+  memcpy(body, pre.c_str(), pre.length());
+  memcpy(body + pre.length(), b64, olen);
+  memcpy(body + pre.length() + olen, post.c_str(), post.length());
+  free(b64);
+  WiFiClient client; HTTPClient h; h.setTimeout(15000);
+  h.begin(client, "http://vop.baidu.com/server_api");
+  h.addHeader("Content-Type", "application/json");
+  int code = h.POST((uint8_t*)body, bodyLen);
+  if (code < 0) {
+    Serial.printf("[asr] 请求失败(%d)，重试一次\n", code);
+    h.end(); vTaskDelay(pdMS_TO_TICKS(300));
+    h.begin(client, "http://vop.baidu.com/server_api");
+    h.addHeader("Content-Type", "application/json");
+    code = h.POST((uint8_t*)body, bodyLen);
+  }
+  free(body);
+  String text = "";
+  if (code == 200) {
+    String resp = h.getString();
+    Serial.printf("[asr] 返回=%s\n", resp.substring(0, 300).c_str());
+    DynamicJsonDocument d(3072);
+    if (!deserializeJson(d, resp)) {
+      int en = d["err_no"] | -1;
+      if (en == 0) text = d["result"][0] | "";
+      else { sendEvent(ERR_JSON, (String("asr ") + en).c_str()); if (en==110||en==111) g_btoken=""; }
+    } else sendEvent(ERR_JSON, "asrparse");
+  } else sendEvent(ERR_HTTP, String(code).c_str());
+  h.end();
+  return text;
+}
+
+// 联网合成语音到PSRAM【不播放】，成功返回true，调用方负责free
+bool ttsFetch(const String& textIn, uint8_t** out, size_t* outLen) {
+  String text = utf8Cap(textIn, 300);
+  if (!text.length()) return false;
+  if (wifiState != WIFI_READY) { sendEvent(ERR_WIFI, "no wifi"); return false; }
+  String tok = baiduToken();
+  if (!tok.length()) { sendEvent(ERR_HTTP, "btoken"); return false; }
+  String body = "tex=" + urlEncode(text) + "&tok=" + tok +
+                "&cuid=xiaoeye&ctp=1&lan=zh&spd=5&pit=5&vol=15&per=0&aue=4";
+  WiFiClient client; HTTPClient h; h.setTimeout(15000);
+  const char* keys[] = { "Content-Type" };
+  h.begin(client, "http://tsn.baidu.com/text2audio");
+  h.collectHeaders(keys, 1);
+  h.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  int code = h.POST(body);
+  String ct = h.header("Content-Type");
+  int clen = h.getSize();
+  Serial.printf("[tts] http=%d ctype=%s len=%d\n", code, ct.c_str(), clen);
+  if (!(code == 200 && ct.indexOf("audio") >= 0)) { sendEvent(ERR_HTTP, "tts"); g_btoken = ""; h.end(); return false; }
+  size_t cap = (clen > 0 && clen < 1500000) ? (size_t)clen : 600000;
+  uint8_t* abuf = (uint8_t*)ps_malloc(cap);
+  if (!abuf) { sendEvent(ERR_OOM, "tts"); h.end(); return false; }
+  WiFiClient* st = h.getStreamPtr();
+  size_t got = 0; uint32_t idle = millis();
+  while (got < cap && (h.connected() || st->available() > 0)) {
+    int avail = st->available();
+    if (avail > 0) {
+      size_t want = ((size_t)avail > cap - got) ? cap - got : (size_t)avail;
+      int n = st->readBytes(abuf + got, want);
+      if (n > 0) { got += n; idle = millis(); }
+    } else {
+      if (millis() - idle > 5000) break;
+      vTaskDelay(pdMS_TO_TICKS(2));
+    }
+  }
+  h.end();
+  Serial.printf("[tts] 下载完成 %u 字节\n", (unsigned)got);
+  if (got < 2) { free(abuf); return false; }
+  *out = abuf; *outLen = got;
+  return true;
+}
+
+// 从内存播放PCM——按 g_volume 实时缩放，不改动原缓存
+void playPcm(const uint8_t* pcm, size_t len) {
+  i2s_set_sample_rates(SPK_I2S_PORT, 16000);
+  i2s_start(SPK_I2S_PORT);
+  i2s_zero_dma_buffer(SPK_I2S_PORT);
+  static int16_t chunk[1024];
+  size_t off = 0;
+  while (off < len) {
+    size_t n = (len - off > sizeof(chunk)) ? sizeof(chunk) : (len - off);
+    n &= ~1; if (!n) break;
+    memcpy(chunk, pcm + off, n);
+    if (g_volume != 100) { for (size_t i = 0; i < n / 2; i++) chunk[i] = (int16_t)((int32_t)chunk[i] * g_volume / 100); }
+    size_t w; i2s_write(SPK_I2S_PORT, chunk, n, &w, portMAX_DELAY);
+    off += n;
+  }
+  delay(60);
+}
+
+// 语音合成并播放
+void ttsSpeak(const String& textIn) {
+  uint8_t* buf; size_t len;
+  if (!ttsFetch(textIn, &buf, &len)) return;
+  sendEvent(EVT_SPEAK, "");
+  playPcm(buf, len);
+  free(buf);
+  Serial.printf("[tts] 播放完成 %u 字节\n", (unsigned)len);
+}
+
+// 播一句"缓存语音"：第一次用时联网合成并常驻PSRAM，之后零延迟秒播
+void speakCached(const char* text, uint8_t** cache, size_t* cacheLen) {
+  if (!*cache) ttsFetch(text, cache, cacheLen);
+  if (*cache) playPcm(*cache, *cacheLen);
+  else playTone(1200, 120);
+}
+
+// ====================== 大模型 API ======================
+void analyzeImage(const uint8_t* jpg, size_t len) {
+  if (wifiState != WIFI_READY) { sendEvent(ERR_WIFI, "not ready"); return; }
+  sendEvent(EVT_AI_START, "");
+  String prefix = String("{\"model\":\"") + g_vlmodel +
+    "\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"" + g_prompt +
+    "\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,";
+  String suffix = "\"}}]}]}";
+  size_t b64len = 4 * ((len + 2) / 3);
+  char* body = (char*)ps_malloc(prefix.length() + b64len + suffix.length() + 1);
+  if (!body) { sendEvent(ERR_OOM, "body"); return; }
+  memcpy(body, prefix.c_str(), prefix.length());
+  size_t olen = 0;
+  mbedtls_base64_encode((unsigned char*)(body + prefix.length()), b64len + 1, &olen, jpg, len);
+  memcpy(body + prefix.length() + olen, suffix.c_str(), suffix.length());
+  size_t bodyLen = prefix.length() + olen + suffix.length();
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient https; https.setTimeout(30000);
+  https.useHTTP10(true);
+  if (!https.begin(client, g_apiurl)) { free(body); sendEvent(ERR_HTTP, "begin"); return; }
+  https.addHeader("Content-Type", "application/json");
+  https.addHeader("Authorization", String("Bearer ") + g_apikey);
+  int code = https.POST((uint8_t*)body, bodyLen);
+  if (code < 0) {
+    Serial.printf("[vl] 请求失败(%d)，重试一次\n", code);
+    https.end(); vTaskDelay(pdMS_TO_TICKS(300));
+    if (!https.begin(client, g_apiurl)) { free(body); sendEvent(ERR_HTTP, "begin"); return; }
+    https.addHeader("Content-Type", "application/json");
+    https.addHeader("Authorization", String("Bearer ") + g_apikey);
+    code = https.POST((uint8_t*)body, bodyLen);
+  }
+  free(body);
+  if (code == 200) {
+    String resp = https.getString();
+    resp.trim();
+    Serial.printf("[vl] 回应%d字节\n", resp.length());
+    StaticJsonDocument<128> filter; filter["choices"][0]["message"]["content"] = true;
+    DynamicJsonDocument doc(6144);
+    if (resp.length() && !deserializeJson(doc, resp, DeserializationOption::Filter(filter))) {
+      const char* content = doc["choices"][0]["message"]["content"] | "";
+      sendEvent(EVT_AI_OK, ""); sendAIAnswer(content); ttsSpeak(content);
+    } else { Serial.printf("[vl] 返回=%s\n", resp.substring(0, 200).c_str()); sendEvent(ERR_JSON, "vl"); }
+  } else {
+    String err = https.getString();
+    Serial.printf("[vl] http=%d 返回=%s\n", code, err.substring(0, 300).c_str());
+    sendEvent(ERR_HTTP, String(code).c_str());
+  }
+  https.end();
+}
+
+// 拍照 + AI识图（按键短按/语音"这是什么"都走这里）
+void captureAndAnalyze() {
+  if (!initCamera()) { sendEvent(ERR_CAM, ""); ttsSpeak("摄像头打不开"); return; }
+  playShutter();
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) { sendEvent(ERR_CAM, "grab"); ttsSpeak("拍照失败"); return; }
+  size_t len = fb->len; sendEvent(EVT_CAP_OK, String(len).c_str());
+  uint8_t* buf = (uint8_t*)ps_malloc(len);
+  if (!buf) { esp_camera_fb_return(fb); sendEvent(ERR_OOM, "copy"); return; }
+  memcpy(buf, fb->buf, len); esp_camera_fb_return(fb);
+  analyzeImage(buf, len); free(buf);
+}
+
+String llmChat(const String& userText) {
+  if (wifiState != WIFI_READY) { sendEvent(ERR_WIFI, "not ready"); return ""; }
+  DynamicJsonDocument doc(4096);
+  doc["model"] = g_chatmodel;
+  doc["max_tokens"] = 200;
+  JsonArray msgs = doc.createNestedArray("messages");
+  JsonObject sys = msgs.createNestedObject();
+  sys["role"] = "system";
+  String sysmsg = "你是一个智能眼镜语音助手，用简短、口语化的中文回答，不要用markdown，不要太长。不确定的信息直接说不知道，不要编造。";
+  String ts = nowString();
+  if (ts.length()) sysmsg += String("当前准确时间是") + ts + "。";
+  sys["content"] = sysmsg;
+  JsonObject u = msgs.createNestedObject();
+  u["role"] = "user"; u["content"] = userText;
+  String body; serializeJson(doc, body);
+  String curl = g_chaturl.length() ? g_chaturl : g_apiurl;
+  String ckey = g_chatkey.length() ? g_chatkey : g_apikey;
+  WiFiClientSecure client; client.setInsecure();
+  HTTPClient https; https.setTimeout(30000);
+  https.useHTTP10(true);
+  if (!https.begin(client, curl)) { sendEvent(ERR_HTTP, "begin"); return ""; }
+  https.addHeader("Content-Type", "application/json");
+  https.addHeader("Authorization", String("Bearer ") + ckey);
+  int code = https.POST(body);
+  if (code < 0) {
+    Serial.printf("[chat] 请求失败(%d)，重试一次\n", code);
+    https.end(); vTaskDelay(pdMS_TO_TICKS(300));
+    if (!https.begin(client, curl)) { sendEvent(ERR_HTTP, "begin"); return ""; }
+    https.addHeader("Content-Type", "application/json");
+    https.addHeader("Authorization", String("Bearer ") + ckey);
+    code = https.POST(body);
+  }
+  String ans = "";
+  if (code == 200) {
+    String resp = https.getString();
+    resp.trim();
+    Serial.printf("[chat] 回应%d字节\n", resp.length());
+    StaticJsonDocument<128> filter; filter["choices"][0]["message"]["content"] = true;
+    DynamicJsonDocument rd(6144);
+    if (resp.length() && !deserializeJson(rd, resp, DeserializationOption::Filter(filter)))
+      ans = rd["choices"][0]["message"]["content"] | "";
+    else { Serial.printf("[chat] 返回=%s\n", resp.substring(0, 200).c_str()); sendEvent(ERR_JSON, "chat"); }
+  } else {
+    String err = https.getString();
+    Serial.printf("[chat] http=%d 返回=%s\n", code, err.substring(0, 300).c_str());
+    sendEvent(ERR_HTTP, String(code).c_str());
+  }
+  https.end();
+  return ans;
+}
+
+// ====================== WiFi 音频串流播放 ======================
+void streamClient(WiFiClient& client) {
+  uint8_t rbuf[1024]; int fill = 0;
+  uint32_t rate = AUDIO_SAMPLE_RATE;
+  uint32_t t0 = millis();
+  while (fill < 8 && millis() - t0 < 800) {
+    int n = client.read(rbuf + fill, 8 - fill);
+    if (n > 0) fill += n; else vTaskDelay(pdMS_TO_TICKS(2));
+    if (!client.connected() && client.available() == 0) break;
+  }
+  if (fill >= 8 && memcmp(rbuf, "AUD1", 4) == 0) {
+    rate = (uint32_t)rbuf[4] | ((uint32_t)rbuf[5]<<8) | ((uint32_t)rbuf[6]<<16) | ((uint32_t)rbuf[7]<<24);
+    if (rate < 8000 || rate > 48000) rate = AUDIO_SAMPLE_RATE;
+    fill = 0;
+  }
+  i2s_set_sample_rates(SPK_I2S_PORT, rate);
+  i2s_zero_dma_buffer(SPK_I2S_PORT);
+  uint32_t idle = millis();
+  for (;;) {
+    int n = client.read(rbuf + fill, sizeof(rbuf) - fill);
+    if (n > 0) { fill += n; idle = millis(); }
+    else { if (!client.connected() && client.available() == 0) break;
+           if (millis() - idle > 8000) break;
+           vTaskDelay(pdMS_TO_TICKS(2)); }
+    int usable = fill - (fill & 1);
+    if (usable >= 2) {
+      if (g_volume != 100) { int16_t* sp = (int16_t*)rbuf; for (int i = 0; i < usable/2; i++) sp[i] = (int16_t)((int32_t)sp[i]*g_volume/100); }
+      size_t w; i2s_write(SPK_I2S_PORT, rbuf, usable, &w, portMAX_DELAY);
+      int rest = fill - usable; if (rest) rbuf[0] = rbuf[usable]; fill = rest;
+    }
+  }
+}
+void audioTask(void*) {
+  bool srvUp = false;
+  for (;;) {
+    if (wifiState == WIFI_READY && !srvUp) { audioServer.begin(); srvUp = true; Serial.printf("Audio server :%d\n", AUDIO_PORT); }
+    if (!srvUp) { vTaskDelay(pdMS_TO_TICKS(300)); continue; }
+    WiFiClient client = audioServer.available();
+    if (client) {
+      client.setNoDelay(true);
+      g_audioPlaying = true; sendEvent(EVT_AUDIO_CONN, "");
+      streamClient(client);
+      client.stop(); i2s_zero_dma_buffer(SPK_I2S_PORT);
+      g_audioPlaying = false; sendEvent(EVT_AUDIO_END, "");
+    } else vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+// ====================== 本地提示音 ======================
+void playTone(int freq, int ms) {
+  i2s_set_sample_rates(SPK_I2S_PORT, 16000);
+  i2s_start(SPK_I2S_PORT);
+  const int N = 256;
+  int16_t buf[N];
+  float phase = 0, step = 2.0f * PI * freq / 16000.0f;
+  int amp = 9000 * g_volume / 100;
+  long total = 16L * ms, done = 0;
+  while (done < total) {
+    int cnt = (total - done < N) ? (total - done) : N;
+    for (int i = 0; i < cnt; i++) { buf[i] = (int16_t)(sinf(phase) * amp); phase += step; if (phase > 2*PI) phase -= 2*PI; }
+    size_t w; i2s_write(SPK_I2S_PORT, buf, cnt * 2, &w, portMAX_DELAY);
+    done += cnt;
+  }
+}
+void playShutter() {
+  playTone(2600, 30);
+  playTone(1400, 45);
+}
+void playBeep() {
+  Serial.printf("[beep] 880Hz 1秒, vol=%d\n", g_volume);
+  i2s_set_sample_rates(SPK_I2S_PORT, 16000);
+  i2s_start(SPK_I2S_PORT);
+  i2s_zero_dma_buffer(SPK_I2S_PORT);
+  const int N = 256;
+  int16_t buf[N];
+  float phase = 0, step = 2.0f * PI * 880 / 16000.0f;
+  long total = 16000, done = 0; long written = 0; esp_err_t ret = ESP_OK;
+  while (done < total) {
+    int cnt = (total - done < N) ? (total - done) : N;
+    for (int i = 0; i < cnt; i++) { buf[i] = (int16_t)(sinf(phase) * 9000); phase += step; if (phase > 2*PI) phase -= 2*PI; }
+    size_t w; ret = i2s_write(SPK_I2S_PORT, buf, cnt * 2, &w, portMAX_DELAY);
+    written += w; done += cnt;
+  }
+  Serial.printf("[beep] 完成 ret=%d 写入=%ld字节\n", (int)ret, written);
+}
+
+// ====================== 本地意图 / 语音路由 ======================
+String nowString() {
+  struct tm t;
+  if (!getLocalTime(&t, 100)) return "";
+  char buf[64];
+  const char* wd[] = {"日","一","二","三","四","五","六"};
+  snprintf(buf, sizeof(buf), "%d年%d月%d日星期%s%d点%d分",
+           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, wd[t.tm_wday], t.tm_hour, t.tm_min);
+  return String(buf);
+}
+int extractNumber(const String& s) {
+  int i = 0, n = s.length();
+  while (i < n && !(s[i] >= '0' && s[i] <= '9')) i++;
+  if (i >= n) return -1;
+  int v = 0;
+  while (i < n && s[i] >= '0' && s[i] <= '9') { v = v * 10 + (s[i] - '0'); i++; if (v > 100000) break; }
+  return v;
+}
+void speakTimeDate(bool wantTime, bool wantDate) {
+  struct tm t;
+  if (!getLocalTime(&t, 200)) { ttsSpeak("还没对上网络时间，请连上网稍等一下再问"); return; }
+  const char* wd[] = {"日","一","二","三","四","五","六"};
+  String s;
+  if (wantDate) s += String("今天是") + (t.tm_mon + 1) + "月" + t.tm_mday + "日，星期" + wd[t.tm_wday];
+  if (wantTime) { if (s.length()) s += "，"; s += String("现在") + t.tm_hour + "点" + t.tm_min + "分"; }
+  notifyText("LOCAL>" + s);
+  ttsSpeak(s);
+}
+// 检测并剥掉唤醒词。宽松匹配：含"同学"直接触发；否则找"小/晓+zhi同音字"
+bool stripWakeWord(String& q) {
+  int cut = -1;
+  int tx = q.indexOf("同学");
+  if (tx >= 0) cut = tx + strlen("同学");
+  else {
+    const char* words[] = {"小智","晓智","小治","小志","小知","小之","小至","小值","小职","小直","小指","小止","小芝","小枝","小跖","小学"};
+    for (int i = 0; i < 16 && cut < 0; i++) {
+      int idx = q.indexOf(words[i]);
+      if (idx >= 0) cut = idx + strlen(words[i]);
+    }
+  }
+  if (cut < 0) return false;
+  q = q.substring(cut);
+  q.trim();
+  while (q.startsWith("，") || q.startsWith("、") || q.startsWith("。") || q.startsWith("！") || q.startsWith("？")) q = q.substring(3);
+  q.trim();
+  return true;
+}
+
+// ====== 本地固定问答表 ======
+// 加一条问答只需加一行：{"触发词1|触发词2|...", "要回答的话"}
+struct QA { const char* keys; const char* answer; };
+const QA LOCAL_QA[] = {
+  {"你是谁|你叫什么|你是什么|你的名字",       "你好呀，我是你的AI助手小智。"},
+  {"什么模型|哪个模型|哪些模型|哪类模型|几个模型|用的模型|什么大模型",  "我用的是混合大模型，嘻嘻。"},
+  {"天气|下雨|气温|冷不冷|热不热|温度多少",   "我也不知道呢，你可以看看窗外。"},
+  {"怎么用|如何使用|怎么使用|说明书|怎么操作", "你可以问问厂家客服。"},
+  {"电量|电池|多少电|还有多少电",             "我还不会看电量哦，插着电用最稳妥。"},
+  {"能做什么|会做什么|帮助我|你会啥|有什么功能", "你可以让我几点了、拍照、调音量、关闭蓝牙，或者直接问我任何问题。"},
+  {"你好|您好|在吗|在不在|哈喽|嗨你好",        "在的，有什么可以帮你？"},
+};
+const int LOCAL_QA_N = sizeof(LOCAL_QA) / sizeof(LOCAL_QA[0]);
+
+bool tryLocalQA(const String& q) {
+  for (int i = 0; i < LOCAL_QA_N; i++) {
+    String keys = LOCAL_QA[i].keys;
+    int start = 0;
+    while (start <= (int)keys.length()) {
+      int bar = keys.indexOf('|', start);
+      String kw = (bar < 0) ? keys.substring(start) : keys.substring(start, bar);
+      if (kw.length() && q.indexOf(kw) >= 0) {
+        notifyText("LOCAL>" + String(LOCAL_QA[i].answer));
+        ttsSpeak(LOCAL_QA[i].answer);
+        return true;
+      }
+      if (bar < 0) break;
+      start = bar + 1;
+    }
+  }
+  return false;
+}
+
+// 语音意图路由
+void routeVoice(const String& qIn) {
+  String q = qIn;
+  if (q.indexOf("蓝牙") >= 0) {
+    if (q.indexOf("关") >= 0) { ttsSpeak("蓝牙已关闭，网络已开启"); prefs.putBool("bt", false); delay(200); ESP.restart(); }
+    else                     { ttsSpeak("蓝牙已开启，网络已关闭"); prefs.putBool("bt", true);  delay(200); ESP.restart(); }
+    return;
+  }
+  if (q.indexOf("重启") >= 0 || q.indexOf("重新启动") >= 0) { ttsSpeak("好的，马上重启"); delay(300); ESP.restart(); return; }
+  if (q.indexOf("唤醒") >= 0) {
+    if (q.indexOf("关") >= 0 || q.indexOf("别") >= 0) { g_wakeEnabled = false; prefs.putBool("wake", false); ttsSpeak("语音唤醒已关闭，需要时长按按键叫我"); return; }
+    if (q.indexOf("开") >= 0) { g_wakeEnabled = true; prefs.putBool("wake", true); ttsSpeak("语音唤醒已打开"); return; }
+  }
+  if (q.indexOf("音量") >= 0 || q.indexOf("声音") >= 0) {
+    int nv = g_volume;
+    if (q.indexOf("最大") >= 0)                              nv = 100;
+    else if (q.indexOf("静音") >= 0 || q.indexOf("最小") >= 0) nv = 0;
+    else if (q.indexOf("大") >= 0)                           nv = g_volume + 20;
+    else if (q.indexOf("小") >= 0)                           nv = g_volume - 20;
+    else { int d = extractNumber(q); if (d >= 0) nv = d; }
+    if (nv < 0) nv = 0; if (nv > 100) nv = 100;
+    g_volume = nv; prefs.putUChar("vol", g_volume);
+    ttsSpeak(String("音量已调到") + g_volume);
+    return;
+  }
+  if (q.indexOf("连上网") >= 0 || q.indexOf("联网了") >= 0 || q.indexOf("有网") >= 0 ||
+      q.indexOf("断网") >= 0 || q.indexOf("有没有网") >= 0 || q.indexOf("网络好") >= 0) {
+    if (wifiState == WIFI_READY) ttsSpeak("网络正常，已经连上啦");
+    else ttsSpeak("还没连上网，请检查一下WiFi");
+    return;
+  }
+  bool wantT = (q.indexOf("几点") >= 0 || q.indexOf("时间") >= 0 || q.indexOf("点了") >= 0);
+  bool wantD = (q.indexOf("几号") >= 0 || q.indexOf("日期") >= 0 || q.indexOf("星期") >= 0 ||
+                q.indexOf("礼拜") >= 0 || q.indexOf("几月") >= 0);
+  if (wantT || wantD) { speakTimeDate(wantT, wantD); return; }
+  if (q.indexOf("拍照") >= 0 || q.indexOf("拍张") >= 0 || q.indexOf("这是什么") >= 0 ||
+      q.indexOf("这是啥") >= 0 || q.indexOf("帮我看") >= 0 || q.indexOf("看看这") >= 0 ||
+      q.indexOf("什么东西") >= 0 || q.indexOf("识别一下") >= 0) {
+    captureAndAnalyze();
+    return;
+  }
+  if (tryLocalQA(q)) return;
+  String ans = llmChat(q);
+  if (ans.length()) { sendAIAnswer(ans.c_str()); ttsSpeak(ans); }
+  else Serial.println("[chat] AI无回应，静默（按用户要求：失败时不出声）");
+}
+
+// 录4秒并识别成文字。endBeep=true时录音结束播低音"咚"
+String recordAndRecognize(bool endBeep) {
+  uint8_t* pcm; size_t len;
+  sendEvent(EVT_REC, String(RECORD_SECONDS).c_str());
+  if (!recordMic(&pcm, &len, RECORD_SECONDS)) { sendEvent(ERR_OOM, "rec"); return ""; }
+  if (endBeep) playTone(700, 120);
+  int16_t* sp16 = (int16_t*)pcm; int mpeak = 0;
+  for (size_t i = 0; i < len / 2; i++) { int a = sp16[i] < 0 ? -sp16[i] : sp16[i]; if (a > mpeak) mpeak = a; }
+  Serial.printf("[mic] 录了 %u 字节, 最大振幅=%d\n", (unsigned)len, mpeak);
+  String q = asrRecognize(pcm, len);
+  free(pcm);
+  return q;
+}
+
+// ====================== 语音对话完整流程 ======================
+// 按键："叮" -> 录4秒 -> "咚" -> 执行
+// 语音唤醒：识别wakeTask抓好的音频 -> 无"小智同学"=静默忽略 ->
+//   带指令直接执行；只喊唤醒词 -> "我在" -> 录4秒 -> "咚" -> 执行
+//   没听清 -> 本地语音"没听清，请再说一遍" -> 自动再录4秒 -> "咚"
+void doVoiceChat(bool needWake) {
+  if (needWake) {
+    uint8_t* wb = g_wakeBuf; size_t wl = g_wakeLen; g_wakeBuf = NULL;
+    if (!wb || wl < 3200) { if (wb) free(wb); return; }
+    String q = asrRecognize(wb, wl);
+    free(wb);
+    if (!q.length()) { Serial.println("[wake] 没识别出内容，进入8秒冷静期"); g_wakeMuteUntil = millis() + 8000; return; }
+    notifyText("WAKE>" + q);
+    if (!stripWakeWord(q)) { Serial.println("[wake] 未含'小智同学'，当噪音忽略，进入8秒冷静期"); g_wakeMuteUntil = millis() + 8000; return; }
+    g_wakeMuteUntil = 0;   // 真唤醒成功，立刻解除冷静期
+    if (q.length() >= 6) { routeVoice(q); return; }
+    speakCached("我在", &g_hintPcm, &g_hintLen);
+    String q2 = recordAndRecognize(true);
+    if (!q2.length()) {
+      speakCached("没听清，请再说一遍", &g_retryPcm, &g_retryLen);
+      q2 = recordAndRecognize(true);
+      if (!q2.length()) return;
+    }
+    notifyText("ASR>" + q2);
+    routeVoice(q2);
+    return;
+  }
+  playTone(1200, 80);
+  String q = recordAndRecognize(true);
+  if (!q.length()) {
+    speakCached("没听清，请再说一遍", &g_retryPcm, &g_retryLen);
+    q = recordAndRecognize(true);
+    if (!q.length()) return;
+  }
+  notifyText("ASR>" + q);
+  routeVoice(q);
+}
+
+// ====================== 工作任务 ======================
+void workerTask(void*) {
+  cmd_t c;
+  for (;;) {
+    if (xQueueReceive(cmdQueue, &c, portMAX_DELAY) != pdPASS) continue;
+    String text = c.text ? String(c.text) : "";
+    if (c.text) free(c.text);
+    if (g_busy) { sendEvent(ERR_BUSY, ""); continue; }
+    g_busy = true;
+    switch (c.cmd) {
+      case CMD_PHOTO: captureAndAnalyze(); break;
+      case CMD_SHOT: {
+        if (!initCamera()) { sendEvent(ERR_CAM, ""); break; }
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) { sendEvent(ERR_CAM, "grab"); break; }
+        size_t len = fb->len; sendEvent(EVT_CAP_OK, String(len).c_str());
+        sendImage(fb->buf, len); esp_camera_fb_return(fb);
+        break;
+      }
+      case CMD_ASK: {
+        notifyText("Q>" + text);
+        String ans = llmChat(text);
+        if (ans.length()) { sendAIAnswer(ans.c_str()); ttsSpeak(ans); }
+        break;
+      }
+      case CMD_SAY:    ttsSpeak(text); break;
+      case CMD_LISTEN: doVoiceChat(text == "wake"); break;
+      case CMD_BEEP:   playBeep();     break;
+    }
+    g_busy = false;
+  }
+}
+
+// ====================== LED / 按键 ======================
+inline void ledWrite(bool on) {
+#if LED_ACTIVE_LOW
+  digitalWrite(LED_PIN, on ? LOW : HIGH);
+#else
+  digitalWrite(LED_PIN, on ? HIGH : LOW);
+#endif
+}
+void updateLed() {
+  uint32_t t = millis(); bool on;
+  if (g_busy)               on = (t % 200) < 100;
+  else if (g_audioPlaying)  on = true;
+  else if (deviceConnected) on = (t % 2000) < 60;
+  else                      on = (t % 1000) < 500;
+  ledWrite(on);
+}
+void pollButton() {
+  static bool prev = true; static uint32_t downT = 0;
+  bool b = digitalRead(BOOT_BTN);
+  if (prev && !b) downT = millis();
+  if (!prev && b) {
+    uint32_t held = millis() - downT;
+    if (held > 1000) enqueueCmd(CMD_LISTEN, "");
+    else if (held > 30) enqueueCmd(CMD_PHOTO, "");
+  }
+  prev = b;
+}
+
+// ====================== 配置加载 / BLE / 启动 ======================
+void loadConfig() {
+  prefs.begin("xeye", false);
+  g_ssid      = prefs.getString("ssid",   DEFAULT_WIFI_SSID);
+  g_pass      = prefs.getString("pass",   DEFAULT_WIFI_PASS);
+  g_apiurl    = prefs.getString("url",    DEFAULT_API_URL);
+  g_apikey    = prefs.getString("key",    DEFAULT_API_KEY);
+  g_vlmodel   = prefs.getString("vlmodel",DEFAULT_VL_MODEL);
+  g_chatmodel = prefs.getString("cmodel", DEFAULT_CHAT_MODEL);
+  g_prompt    = prefs.getString("prompt", DEFAULT_AI_PROMPT);
+  g_bkey      = prefs.getString("bkey",   BAIDU_API_KEY);
+  g_bsec      = prefs.getString("bsec",   BAIDU_SECRET_KEY);
+  g_chaturl   = prefs.getString("chaturl", DEFAULT_CHAT_URL);
+  g_chatkey   = prefs.getString("chatkey", DEFAULT_CHAT_KEY);
+  g_volume    = prefs.getUChar("vol",     DEFAULT_VOLUME);
+  g_wakeEnabled = prefs.getBool("wake",   DEFAULT_WAKE_ON);
+  g_wakeThresh  = prefs.getInt("wakelvl", WAKE_THRESH_DEFAULT);
+  g_btEnabled   = prefs.getBool("bt",     false);   // false=WiFi模式(默认) true=蓝牙模式
+}
+void initBLE() {
+  BLEDevice::init(BLE_DEVICE_NAME);
+  BLEDevice::setMTU(247);
+  BLEDevice::setPower(ESP_PWR_LVL_P9);
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCb());
+  BLEService* svc = pServer->createService(SERVICE_UUID);
+  pTx = svc->createCharacteristic(CHARACTERISTIC_UUID_TX, BLECharacteristic::PROPERTY_NOTIFY);
+  pTx->addDescriptor(new BLE2902());
+  BLECharacteristic* pRx = svc->createCharacteristic(
+      CHARACTERISTIC_UUID_RX, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  pRx->setCallbacks(new RxCb());
+  svc->start();
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(SERVICE_UUID);
+  adv->setScanResponse(true);
+  adv->setMinPreferred(0x06); adv->setMaxPreferred(0x12);
+  BLEDevice::startAdvertising();
+}
+void setup() {
+  Serial.begin(115200); delay(300);
+  esp_reset_reason_t rr = esp_reset_reason();
+  const char* rrs = rr==ESP_RST_POWERON?"上电":rr==ESP_RST_SW?"软件重启":
+                    rr==ESP_RST_PANIC?"崩溃PANIC":rr==ESP_RST_BROWNOUT?"供电不足BROWNOUT":
+                    rr==ESP_RST_TASK_WDT?"任务看门狗":rr==ESP_RST_INT_WDT?"中断看门狗":"其他";
+  Serial.printf("\n=== 复位原因: %d (%s) ===\n", (int)rr, rrs);
+  pinMode(BOOT_BTN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT); ledWrite(false);
+  Serial.println("boot hold 3s...");
+  for (int i = 0; i < 30; i++) { ledWrite(i % 2); delay(100); }
+  ledWrite(false);
+  loadConfig();
+  notifyMutex = xSemaphoreCreateMutex();
+  initSpeaker();
+  // —— 模式二选一（两者共用一根天线，彻底分开最稳）——
+  if (g_btEnabled) {
+    initBLE();
+    WiFi.mode(WIFI_OFF);   // 蓝牙模式：WiFi彻底关闭！语音识别/AI/播报全部不可用
+    Serial.println("[mode] 蓝牙模式：BLE开、WiFi关。想回WiFi模式：串口或手机APP发 btoff");
+  } else {
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);  // WiFi独占天线，关省电模式联网最稳（蓝牙没开，关省电是安全的）
+    Serial.println("[mode] WiFi模式：BLE关、WiFi开，语音助手完整可用");
+  }
+  cmdQueue = xQueueCreate(4, sizeof(cmd_t));
+  xTaskCreatePinnedToCore(workerTask, "worker", 12288, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(audioTask,  "audio",  6144,  NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(wakeTask,   "wake",   8192,  NULL, 1, NULL, 0);
+  Serial.println("Setup done");
+}
+void loop() {
+  static uint32_t lastWifi = 0, lastLed = 0;
+  pollSerial();
+  uint32_t now = millis();
+  if (!g_btEnabled && now - lastWifi > 1000) { updateWiFi(); lastWifi = now; }
+  if (now - lastLed  > 30)   { updateLed(); pollButton(); lastLed = now; }
+  delay(5);
+}
